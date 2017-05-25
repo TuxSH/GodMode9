@@ -39,7 +39,34 @@
 #define SECTOR_NAME     "sector0x96.bin"
 #define SECRET_NAME     "secret_sector.bin"
 #define OTP_NAME        "otp.bin"
-#define OTP_BIG_NAME    "otp0x108.bin"  
+#define OTP_BIG_NAME    "otp0x108.bin"
+
+// 0x110...0x118 in the NAND NCSD header
+// see: https://www.3dbrew.org/wiki/NCSD#NCSD_header
+#define NP_TYPE_NONE        0
+#define NP_TYPE_STD         1
+#define NP_TYPE_FAT         2 // this is of our own making
+#define NP_TYPE_FIRM        3
+#define NP_TYPE_AGB         4
+#define NP_TYPE_NCSD        5 // this is of our own making
+#define NP_TYPE_D0K3        6 // my own partition ^_^
+#define NP_TYPE_SECRET      7 // this is of our own making
+#define NP_TYPE_BONUS       8 // this is of our own making
+
+// 0x118...0x120 in the NAND NCSD header
+// see: https://www.3dbrew.org/wiki/NCSD#NCSD_header
+#define NP_SUBTYPE_NONE     0
+#define NP_SUBTYPE_TWL      1
+#define NP_SUBTYPE_CTR      2
+#define NP_SUBTYPE_CTR_N    3
+
+
+typedef struct {
+    u32 sector;
+    u32 count;
+    u32 keyslot;
+} __attribute__((packed)) NandPartitionInfo;
+
 
 bool InitNandCrypto(void);
 bool CheckSlot0x05Crypto(void);
@@ -52,7 +79,9 @@ int WriteNandBytes(const u8* buffer, u64 offset, u64 count, u32 keyslot, u32 nan
 int ReadNandSectors(u8* buffer, u32 sector, u32 count, u32 keyslot, u32 src);
 int WriteNandSectors(const u8* buffer, u32 sector, u32 count, u32 keyslot, u32 dest);
 
+u32 GetNandMinSizeSectors(u32 nand_src);
 u64 GetNandSizeSectors(u32 src);
+u32 GetNandPartitionInfo(NandPartitionInfo* info, u32 type, u32 subtype, u32 index, u32 nand_src);
 u64 GetNandUnusedSectors(u32 src);
 u32 CheckNandMbr(u8* mbr);
 u32 CheckNandHeader(u8* header);

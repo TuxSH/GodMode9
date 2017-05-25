@@ -5,6 +5,7 @@
 #include "keydb.h"
 #include "aes.h"
 #include "sha.h"
+#include "fatmbr.h"
 #include "sdmmc.h"
 #include "image.h"
 
@@ -12,6 +13,37 @@
 
 #define KEY95_SHA256    ((IS_DEVKIT) ? slot0x11Key95dev_sha256 : slot0x11Key95_sha256)
 #define SECTOR_SHA256   ((IS_DEVKIT) ? sector0x96dev_sha256 : sector0x96_sha256)
+
+typedef struct {
+	u32 offset;
+	u32 size;
+} __attribute__((packed)) NandNcsdPartition;
+
+// see: https://www.3dbrew.org/wiki/NCSD#NCSD_header
+typedef struct {
+	u8  signature[0x100];
+	u8  magic[4];
+	u32 size;
+	u64 mediaId;
+	u8  partitions_fs_type[8];
+	u8  partitions_crypto_type[8];
+	NandNcsdPartition partitions[8];
+	u8  unknown[0x5E];
+    u8  twl_mbr[0x42];
+} __attribute__((packed)) NandNcsdHeader;
+
+// see: https://www.3dbrew.org/wiki/NCSD#NCSD_header
+static const u32 np_keyslots[9][4] = { // [NP_TYPE][NP_SUBTYPE]
+    { 0xFF, 0xFF, 0xFF, 0xFF }, // none
+    { 0xFF, 0x03, 0x04, 0x05 }, // standard
+    { 0xFF, 0x03, 0x04, 0x05 }, // FAT (custom, not in NCSD)
+    { 0xFF, 0xFF, 0x06, 0xFF }, // FIRM
+    { 0xFF, 0xFF, 0x07, 0xFF }, // AGBSAVE
+    { 0xFF, 0xFF, 0xFF, 0xFF }, // NCSD (custom)
+    { 0xFF, 0xFF, 0xFF, 0xFF }, // D0K3 (custom)
+    { 0xFF, 0xFF, 0xFF, 0x11 }, // SECRET (custom)
+    { 0xFF, 0xFF, 0xFF, 0xFF }  // BONUS (custom)
+};
 
 static u8 slot0x05KeyY[0x10] = { 0x00 }; // need to load this from FIRM0 / external file
 static const u8 slot0x05KeyY_sha256[0x20] = { // hash for slot0x05KeyY (16 byte)
@@ -390,6 +422,89 @@ int WriteNandSectors(const u8* buffer, u32 sector, u32 count, u32 keyslot, u32 n
     
     return 0;
 }
+
+u32 GetNandMinSizeSectors(u32 nand_src) // in sectors
+{
+    u32 nand_minsize = 1;
+    
+    NandNcsdHeader ncsd;
+    ReadNandSectors((u8*) &ncsd, 0x00, 1, 0xFF, nand_src);
+    for (u32 prt_idx = 0; prt_idx < 8; prt_idx++) {
+        u32 prt_end = ncsd.partitions[prt_idx].offset + ncsd.partitions[prt_idx].size;
+        if (prt_end > nand_minsize) nand_minsize = prt_end;
+    }
+    
+    return nand_minsize;
+}
+
+u32 GetNandPartitionInfo(NandPartitionInfo* info, u32 type, u32 subtype, u32 index, u32 nand_src)
+{
+    // workaround for ZERONAND
+    if (nand_src == NAND_ZERONAND) nand_src = NAND_SYSNAND;
+    
+    // safety / set keyslot
+    if ((type > NP_TYPE_BONUS) || (subtype > NP_SUBTYPE_CTR_N)) return 1;
+    info->keyslot = np_keyslots[type][subtype];
+    
+    // full (minimum) NAND "partition"
+    if (type == NP_TYPE_NONE) {
+        info->sector = 0x00;
+        info->count = GetNandMinSizeSectors(nand_src);
+        return 0;
+    }
+    
+    // special, custom partition types, not in NCSD
+    if (type >= NP_TYPE_NCSD) {
+        if (type == NP_TYPE_NCSD) {
+            info->sector = 0x00; // hardcoded
+            info->count = 0x01;
+        } else if (type == NP_TYPE_D0K3) {
+            info->sector = 0x01; // hardcoded
+            info->count = SECTOR_SECRET - info->sector;
+        } else if (type == NP_TYPE_SECRET) {
+            info->sector = SECTOR_SECRET;
+            info->count = 0x01;
+        } else if (type == NP_TYPE_BONUS) {
+            info->sector = GetNandMinSizeSectors(nand_src);
+            info->count = GetNandSizeSectors(nand_src) - info->sector;
+        }
+        return 0;
+    }
+    
+    // find type & subtype in NCSD header
+    u8 header[0x200];
+    ReadNandSectors(header, 0x00, 1, 0xFF, nand_src);
+    NandNcsdHeader* ncsd = (NandNcsdHeader*) header;
+    u32 prt_idx = 8;
+    if (type != NP_TYPE_FAT) for (prt_idx = 0; prt_idx < 8; prt_idx++) {
+        if ((ncsd->partitions_fs_type[prt_idx] != type) ||
+            (ncsd->partitions_crypto_type[prt_idx] != subtype)) continue;
+        if (index == 0) break;
+        index--;
+    } else for (prt_idx = 0; prt_idx < 8; prt_idx++) {
+        if ((ncsd->partitions_fs_type[prt_idx] == NP_TYPE_STD) &&
+            (ncsd->partitions_crypto_type[prt_idx] == subtype)) break;
+    }
+    if ((prt_idx >= 8) || (type >= 5) || (subtype >= 4)) return 1; // not found
+    
+    // set sector / count
+    info->sector = ncsd->partitions[prt_idx].offset;
+    info->count = ncsd->partitions[prt_idx].size;
+    
+    // FAT type specific stuff
+    if (type == NP_TYPE_FAT) {
+        ReadNandSectors(header, info->sector, 1, info->keyslot, nand_src);
+        MbrHeader* mbr = (MbrHeader*) header;
+        if ((ValidateMbrHeader(mbr) != 0) || (index >= 4) ||
+            (mbr->partitions[index].sector == 0) || (mbr->partitions[index].count == 0) ||
+            (mbr->partitions[index].sector + mbr->partitions[index].count > info->count))
+            return 1;
+        info->sector += mbr->partitions[index].sector;
+        info->count = mbr->partitions[index].count;
+    }
+    
+    return 0;
+}    
 
 u32 CheckNandMbr(u8* mbr)
 {
